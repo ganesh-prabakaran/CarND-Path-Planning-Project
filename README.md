@@ -80,6 +80,8 @@ Observations:
 
 To make computation easier, I transformed the input data in global coordinates to car coordinates - assuming x,y,yaw to be 0,0,0 respectively. Similarly, only distance between vehicles are considered for navigating the vehicle in this project implementation. More complexity can be added by computing the cost including speed of other vehicles. 
 
+Output Video:
+[click here for viewing output video](https://youtu.be/KLfiNaDZnsA)
 
 ---
 
