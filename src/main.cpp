@@ -8,16 +8,30 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
+#include <algorithm>
+#include <map>
 
 using namespace std;
 
 // for convenience
 using json = nlohmann::json;
 
+struct stats{
+		bool too_close;
+		bool prepare_lane_change;
+		double forward_gap;
+		double backward_gap;
+		double forward_speed;
+		double backward_speed;
+
+};
+	
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
+
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -163,6 +177,72 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+vector<stats> get_lane_summary(vector<vector<double>> sensor_fusion, int prev_size, double car_s, double forward_threshold, double backward_threshold, int cur_lane){
+	stats init = {.too_close = false, .prepare_lane_change = false, .forward_gap = 9999, .backward_gap = 9999, .forward_speed = 0, .backward_speed = 0};
+	vector<stats> result;
+	
+	int lane_size = 3;
+	for (int i = 0; i < lane_size; i++){
+		result.push_back(init);
+	}
+	
+	for (int i = 0; i < sensor_fusion.size(); i++){
+		// 
+		float d = sensor_fusion[i][6];
+		for (int j = 0; j < lane_size; j++){
+			int temp_backward_threshold;
+			if (j == cur_lane){
+				temp_backward_threshold = 0;
+			}else{
+				temp_backward_threshold = backward_threshold;
+			}
+				
+			if (d  < (2 + 4 * j + 2) && d > (2 + 4 * j - 2 ) ){
+				double vx = sensor_fusion[i][3];
+				double vy = sensor_fusion[i][4];
+				double check_speed = sqrt(vx * vx + vy * vy);
+				double check_car_s = sensor_fusion[i][5];
+				
+				// Project s value if using previous points
+				check_car_s += ((double)prev_size * .02 * check_speed); 
+					
+				if ((check_car_s + temp_backward_threshold > car_s) && (check_car_s - car_s < forward_threshold)){
+					result[j].too_close = true;
+				}
+				
+				if (cur_lane == j){
+					if ((check_car_s - car_s > forward_threshold) && (check_car_s - car_s < 2 * forward_threshold)){
+						result[j].prepare_lane_change = true;
+					}
+				}
+				
+				if (check_car_s > car_s) {
+						if (check_car_s < result[j].forward_gap){
+							result[j].forward_gap = check_car_s;
+							result[j].forward_speed = check_speed;
+						}
+					}else{
+						if (check_car_s < result[j].backward_gap){
+							result[j].backward_gap = check_car_s;
+							result[j].backward_speed = check_speed;
+						}
+						
+				}
+				
+
+			}
+		}
+		
+	}
+	/*
+	// Print vehicle stats from each lane
+	for (int i = 0; i < lane_size; i++){
+		std::cout << "Lane: " << i << "Prepare Lane Change" << result[i].prepare_lane_change << " forward Gap: " << result[i].forward_gap << " backward Gap: " << result[i].backward_gap << " forward Speed: " << result[i].forward_speed << " backward Speed: " << result[i].backward_speed << std::endl;
+	}
+	*/
+	return result;
+}
+
 int main() {
   uWS::Hub h;
 
@@ -200,13 +280,19 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  int lane = 1;
+  
+  double ref_vel = 0;
+  
+  h.onMessage([&ref_vel, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy, &lane](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
     //auto sdata = string(data).substr(0, length);
     //cout << sdata << endl;
+
+
     if (length && length > 2 && data[0] == '4' && data[1] == '2') {
 
       auto s = hasData(data);
@@ -239,11 +325,177 @@ int main() {
 
           	json msgJson;
 
-          	vector<double> next_x_vals;
+            // Create a list of widely spaced waypoints (30m) to be used to fit in a spline and interpolate to add more way points.
+			vector<double> ptsx;
+			vector<double> ptsy;
+			
+			vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+			
+			//reference x, y, and yaw states;
+			double ref_x = car_x;
+			double ref_y = car_y;
+			double ref_yaw = deg2rad(car_yaw);
+			
+			//If previous path available assign the longitudinal distance 's' value from the last value in previous path
+			int prev_size = previous_path_x.size();
+			
+			if (prev_size > 0){
+				car_s = end_path_s;
+			}
+			
+			bool too_close = false;
+			
+			bool change_left_feasible = false;
+			bool change_right_feasible = false;
+			
+			int forward_threshold = 30;
+			int backward_threshold = 20;
+			
+	
+			//auto stat = check_feasibility(sensor_fusion, prev_size, car_s, lane, forward_threshold, backward_threshold, "KL");
+			auto stat = get_lane_summary(sensor_fusion, prev_size, car_s, forward_threshold, backward_threshold, lane);
+			too_close = stat[lane].too_close;//stat[0];
+			
+			
+			if (stat[lane].too_close || stat[lane].prepare_lane_change){
+				if (stat[lane].too_close){
+					ref_vel -= .224;
+				}
+				else if (ref_vel < 40.5){
+					ref_vel += .224;
+				}
+			    int left_lane = lane - 1;
+				if (left_lane >=0){
+					change_left_feasible = true;
+					if (stat[left_lane].too_close){
+						change_left_feasible = false;
+					}
+				}
+				int right_lane = lane + 1;
+				if (right_lane <=2){
+					change_right_feasible = true;
+					if (stat[right_lane].too_close){
+						change_right_feasible = false;
+					}
+				}
+                if (change_left_feasible && change_right_feasible){
+					if (stat[left_lane].forward_gap > stat[right_lane].forward_gap){
+						change_right_feasible = false;
+					}
+					else{
+						change_left_feasible = false;
+					}
+				}				
+				if (change_left_feasible){
+					lane -= 1;
+				}
+				else if (change_right_feasible){
+					lane += 1;
+				}
+			}
+			else if (ref_vel < 49.5){
+				ref_vel += .224;
+			}
+			
+			// Get last two coordinates from previous path (if available) to maintain continuity of path.
+			// If previous path not available, calculate based on current car coordinates
+            			
+            if (prev_size < 2){
+				double prev_car_x = car_x - cos(car_yaw);
+				double prev_car_y = car_y - sin(car_yaw);
+				
+				ptsx.push_back(prev_car_x);
+				ptsx.push_back(car_x);
+				
+				ptsy.push_back(prev_car_y);
+				ptsy.push_back(car_y);
+				
+			}
+			else{
+				ref_x = previous_path_x[prev_size - 1];
+				ref_y = previous_path_y[prev_size - 1];
+				
+				double ref_x_prev = previous_path_x[prev_size - 2];
+				double ref_y_prev = previous_path_y[prev_size - 2];
+				
+				ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+				ptsx.push_back(ref_x_prev);
+				ptsx.push_back(ref_x);
+				
+				ptsy.push_back(ref_y_prev);
+				ptsy.push_back(ref_y);				
+				
+			}
+			
+			// Define far spaced spline knots 
+			vector<double> next_wp0 = getXY(car_s + 30, (2 + 4 * lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp1 = getXY(car_s + 60, (2 + 4 * lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp2 = getXY(car_s + 90, (2 + 4 * lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			
+			ptsx.push_back(next_wp0[0]);
+			ptsx.push_back(next_wp1[0]);
+			ptsx.push_back(next_wp2[0]);
+			
+			ptsy.push_back(next_wp0[1]);
+			ptsy.push_back(next_wp1[1]);
+			ptsy.push_back(next_wp2[1]);
+			
+			//Transofrm spline knots to car corrdinates to simplify math
+			for (int i = 0; i < ptsx.size(); i++){
+				
+				double shift_x = ptsx[i] - ref_x;
+				double shift_y = ptsy[i] - ref_y;
+				
+				ptsx[i] = (shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw));
+				ptsy[i] = (shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw));
+			}
+			
+			
+			// create a spline object
+			tk::spline s;
+			
+			// Fit spline
+			s.set_points(ptsx, ptsy);
+			
+          	// Push the left over from previous path for next set of xy values
+            for (int i = 0; i < previous_path_x.size(); i++){
+				next_x_vals.push_back(previous_path_x[i]);
+				next_y_vals.push_back(previous_path_y[i]);
+			}				
+			
+			// calculate how to break up the spline points inorder to get the desired speed
+			double target_x = 30.0;
+			double target_y = s(target_x);
+			double target_dist = sqrt((target_x) * (target_x) + (target_y) * (target_y));
+			
+			
+			double x_ccpoint=0, y_ccpoint;
+			
+			// Find the number of split points to get the desired speed. 
+			// .02 secs for each point 
+			// 2.24 - conversion from miles/hour to meters/sec
+			double N = (target_dist/(.02 * ref_vel / 2.24));	
+			
+			//  Generate xpoints and convert into global cooridnates
+			for (int i = 0; i <= 50 - previous_path_x.size(); i++){
+				
+					
+				x_ccpoint +=(target_x) / N;
+				y_ccpoint = s(x_ccpoint);
+				
+				// Retransformation - Rotation & Shift
+				double x_gcpoint = (x_ccpoint * cos(ref_yaw) - y_ccpoint * sin(ref_yaw)) + ref_x;
+				double y_gcpoint = (x_ccpoint * sin(ref_yaw) + y_ccpoint * cos(ref_yaw)) + ref_y;				
+				
+				next_x_vals.push_back(x_gcpoint);
+				next_y_vals.push_back(y_gcpoint);
+			
+			
+			}
+			
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
